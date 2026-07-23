@@ -1,0 +1,6 @@
+.env
+seen_jobs.json
+tracker.log
+__pycache__/
+*.pyc
+.idea/
