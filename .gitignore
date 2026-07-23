@@ -1,6 +1,8 @@
 .env
 seen_jobs.json
+uf_seen_jobs.json
 tracker.log
+uf_tracker.log
 resumes/
 __pycache__/
 *.pyc
