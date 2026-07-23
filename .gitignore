@@ -1,6 +1,7 @@
 .env
 seen_jobs.json
 tracker.log
+resumes/
 __pycache__/
 *.pyc
 .idea/

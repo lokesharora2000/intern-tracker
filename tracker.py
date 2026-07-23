@@ -21,6 +21,8 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlencode, quote_plus
 
+from resume_gen import generate_resumes_for_jobs
+
 # ── Config ──────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent
@@ -365,7 +367,7 @@ def scrape_all() -> list[dict]:
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 
-def build_email_html(new_jobs: list[dict], check_date: str) -> str:
+def build_email_html(new_jobs: list[dict], check_date: str, resume_count: int = 0) -> str:
     if not new_jobs:
         body = "<p>No new Summer 2027 internship postings found today. Check back tomorrow!</p>"
     else:
@@ -409,6 +411,17 @@ def build_email_html(new_jobs: list[dict], check_date: str) -> str:
           <a href="https://joinhandshake.com/search?query=software+engineer+intern+2027">Handshake</a>
         </p>"""
 
+    resume_note = ""
+    if resume_count > 0:
+        resume_note = f"""
+      <div style="background:#f0f7ff;border:1px solid #c8e0ff;border-radius:6px;padding:12px 16px;margin-top:16px">
+        <strong style="color:#1a73e8">📄 {resume_count} tailored resume(s) generated</strong>
+        <p style="margin:4px 0 0;font-size:13px;color:#555">
+          Saved to <code>~/personal_work/intern-tracker/resumes/{check_date}/</code><br>
+          Open any .html file in your browser → File → Print → Save as PDF to get a print-ready resume.
+        </p>
+      </div>"""
+
     return f"""
     <html><body style="font-family:Arial,sans-serif;max-width:900px;margin:0 auto;padding:20px;color:#333">
       <div style="border-left:4px solid #1a73e8;padding-left:16px;margin-bottom:20px">
@@ -416,6 +429,7 @@ def build_email_html(new_jobs: list[dict], check_date: str) -> str:
         <p style="margin:4px 0 0;color:#666;font-size:13px">{check_date} · SWE · ML · AI · Data roles · US companies</p>
       </div>
       {body}
+      {resume_note}
       <hr style="border:none;border-top:1px solid #eee;margin:30px 0">
       <p style="color:#aaa;font-size:11px">
         Tracking {len(open(COMPANIES_FILE).read().split('"name"')) - 1} companies ·
@@ -475,6 +489,14 @@ def main():
     seen.update(new_ids)
     save_seen_jobs(seen)
 
+    # Generate tailored resumes for every new job
+    resume_paths = []
+    if new_jobs:
+        log.info("=" * 40)
+        log.info("Phase 3: Generating tailored resumes")
+        log.info("=" * 40)
+        resume_paths = generate_resumes_for_jobs(new_jobs)
+
     # Build and send email
     check_date = datetime.now().strftime("%B %d, %Y")
     if new_jobs:
@@ -482,7 +504,7 @@ def main():
     else:
         subject = f"[Intern Tracker] No new postings today — {check_date}"
 
-    html = build_email_html(new_jobs, check_date)
+    html = build_email_html(new_jobs, check_date, resume_count=len(resume_paths))
     send_email(subject, html)
 
     log.info("Done.")
