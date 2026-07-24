@@ -114,11 +114,17 @@ def is_relevant_title(title: str) -> bool:
 
 def is_relevant_season(title: str, description: str = "") -> bool:
     combined = (title + " " + description).lower()
-    # If no year mentioned, assume it might be relevant (catch-all)
-    has_year = any(yr in combined for yr in ["2025", "2026", "2027", "2028"])
-    if not has_year:
+    # Explicitly exclude stale cycles
+    stale = ["summer 2025", "fall 2025", "spring 2026", "summer 2026",
+             "fall 2026", "winter 2026", "2025 intern", "2026 intern"]
+    if any(kw in combined for kw in stale):
+        return False
+    # If 2027 is mentioned anywhere, include
+    if "2027" in combined:
         return True
-    return any(kw in combined for kw in TARGET_SEASON_KEYWORDS)
+    # No year → assume newly opened role (may be 2027), include
+    has_year = any(yr in combined for yr in ["2025", "2026", "2028"])
+    return not has_year
 
 # ── Platform scrapers ─────────────────────────────────────────────────────────
 

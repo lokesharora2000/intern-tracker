@@ -38,8 +38,6 @@ JOB_LINK  = "https://explore.jobs.ufl.edu/cw/en-us/job/{id}/{slug}"
 # Job types Lokesh wants — must match at least one (whole-phrase match in title)
 TARGET_KEYWORDS = [
     "student assistant", "student aide", "student worker",
-    "fws student", "fws -", "federal work study",
-    "work study",
     "ops student", "ops research assistant", "ops lab",
     "ops event", "ops administrative", "ops office",
     "ops documentation", "ops data", "ops it",
