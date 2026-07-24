@@ -5,6 +5,7 @@ using keyword matching and rule-based scoring. No external API needed.
 Saves output as a clean HTML file (open in browser → Print → Save as PDF).
 """
 
+from __future__ import annotations
 import re
 import logging
 from pathlib import Path
