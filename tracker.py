@@ -32,7 +32,7 @@ COMPANIES_FILE = SCRIPT_DIR / "companies.json"
 
 # Email — set via env vars or edit directly
 GMAIL_USER = os.environ.get("GMAIL_USER", "3lokesharora@gmail.com")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")  # Gmail app password
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "jkxf mgcp lebv whmr")  # Gmail app password
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "3lokesharora@gmail.com")
 
 TARGET_KEYWORDS = [

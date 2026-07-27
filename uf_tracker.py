@@ -28,7 +28,7 @@ LOG_FILE      = SCRIPT_DIR / "uf_tracker.log"
 RESUMES_DIR   = Path("/Users/lokesharora/personal_work/uf_jobs/resumes")
 
 GMAIL_USER       = os.environ.get("GMAIL_USER", "3lokesharora@gmail.com")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "jkxf mgcp lebv whmr")
 RECIPIENT_EMAIL  = os.environ.get("RECIPIENT_EMAIL", "3lokesharora@gmail.com")
 
 # PageUp instance ID 674 = UF
