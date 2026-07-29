@@ -13,13 +13,14 @@ import hashlib
 import time
 import random
 import logging
+import html as html_lib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode, quote_plus, urljoin, urlparse
 
 from resume_gen import generate_resumes_for_jobs
 
@@ -51,6 +52,12 @@ GREENHOUSE_API = "https://boards-api.greenhouse.io/v1/boards/{}/jobs?content=tru
 
 # Lever API base
 LEVER_API = "https://api.lever.co/v0/postings/{}"
+
+# Ashby job board API base
+ASHBY_API = "https://api.ashbyhq.com/posting-api/job-board/{}?includeCompensation=true"
+
+# SmartRecruiters API base
+SMARTRECRUITERS_API = "https://api.smartrecruiters.com/v1/companies/{}/postings?{}"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,9 +95,14 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def fetch_json(url: str, timeout: int = 15) -> dict | list | None:
+def fetch_json(url: str, timeout: int = 15, data: dict | None = None) -> dict | list | None:
     try:
-        req = Request(url, headers=HEADERS)
+        headers = dict(HEADERS)
+        body = None
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(data).encode("utf-8")
+        req = Request(url, data=body, headers=headers)
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except (URLError, HTTPError, json.JSONDecodeError, Exception) as e:
@@ -126,71 +138,355 @@ def is_relevant_season(title: str, description: str = "") -> bool:
     has_year = any(yr in combined for yr in ["2025", "2026", "2028"])
     return not has_year
 
+# ── Scraper helpers ───────────────────────────────────────────────────────────
+
+def polite_sleep():
+    time.sleep(random.uniform(0.5, 1.5))
+
+
+def strip_html(value: str) -> str:
+    value = str(value or "")
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
+
+
+def make_absolute_url(base_url: str, href: str) -> str:
+    if not href:
+        return ""
+    return urljoin(base_url, html_lib.unescape(href))
+
+
+def get_first(value, keys: list[str], default: str = "") -> str:
+    if not isinstance(value, dict):
+        return default
+    for key in keys:
+        item = value.get(key)
+        if item:
+            return str(item)
+    return default
+
+
+def parse_ashby_id(company: dict) -> str:
+    if company.get("ashby_id"):
+        return company["ashby_id"]
+    career_url = company.get("career_url", "")
+    parsed = urlparse(career_url)
+    if "ashbyhq.com" in parsed.netloc:
+        return parsed.path.strip("/").split("/")[0]
+    return company["name"].lower().replace(" ", "").replace("/", "")
+
+
+def parse_smartrecruiters_id(company: dict) -> str:
+    if company.get("smartrecruiters_id"):
+        return company["smartrecruiters_id"]
+    career_url = company.get("career_url", "")
+    parsed = urlparse(career_url)
+    if "smartrecruiters.com" in parsed.netloc:
+        parts = [p for p in parsed.path.split("/") if p]
+        if parts:
+            return parts[0]
+    return company["name"].replace(" ", "")
+
+
+def parse_workday_parts(company: dict) -> tuple[str, str, str] | None:
+    career_url = company.get("career_url", "")
+    parsed = urlparse(career_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+
+    parts = [p for p in parsed.path.split("/") if p]
+    if parts and re.fullmatch(r"[a-z]{2}-[A-Z]{2}", parts[0]):
+        parts = parts[1:]
+    if parts and parts[-1].lower() == "jobs":
+        parts = parts[:-1]
+    if not parts:
+        return None
+
+    tenant = parsed.netloc.split(".")[0]
+    site = parts[0]
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    return base_url, tenant, site
+
+
+def extract_icims_jobs_from_html(html: str, base_url: str, company: dict) -> list[dict]:
+    results = []
+    blocks = re.findall(r"<a\b[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html, re.IGNORECASE | re.DOTALL)
+    for href, text in blocks:
+        title = strip_html(text)
+        if not title or not is_relevant_title(title):
+            continue
+        if not is_relevant_season(title):
+            continue
+        full_url = make_absolute_url(base_url, href)
+        if not full_url:
+            continue
+        results.append({
+            "company": company["name"],
+            "title": title,
+            "url": full_url,
+            "location": "US",
+            "platform": "iCIMS",
+            "tags": company.get("tags", []),
+        })
+    return results
+
 # ── Platform scrapers ─────────────────────────────────────────────────────────
 
 def scrape_greenhouse(company: dict) -> list[dict]:
-    greenhouse_id = company.get("greenhouse_id") or company["name"].lower().replace(" ", "")
-    url = GREENHOUSE_API.format(greenhouse_id)
-    data = fetch_json(url)
-    if not data or "jobs" not in data:
-        return []
+    try:
+        greenhouse_id = company.get("greenhouse_id") or company["name"].lower().replace(" ", "")
+        url = GREENHOUSE_API.format(greenhouse_id)
+        data = fetch_json(url)
+        if not data or "jobs" not in data:
+            return []
 
-    results = []
-    for job in data["jobs"]:
-        title = job.get("title", "")
-        if not is_relevant_title(title):
-            continue
-        desc = job.get("content", "")
-        if not is_relevant_season(title, desc):
-            continue
-        job_url = job.get("absolute_url", "")
-        results.append({
-            "company": company["name"],
-            "title": title,
-            "url": job_url,
-            "location": ", ".join(
-                [loc.get("name", "") for loc in job.get("offices", [])]
-            ) or "US",
-            "platform": "Greenhouse",
-            "tags": company.get("tags", []),
-        })
-    return results
+        results = []
+        for job in data["jobs"]:
+            title = job.get("title", "")
+            if not is_relevant_title(title):
+                continue
+            desc = job.get("content", "")
+            if not is_relevant_season(title, desc):
+                continue
+            job_url = job.get("absolute_url", "")
+            results.append({
+                "company": company["name"],
+                "title": title,
+                "url": job_url,
+                "location": ", ".join(
+                    [loc.get("name", "") for loc in job.get("offices", [])]
+                ) or "US",
+                "platform": "Greenhouse",
+                "tags": company.get("tags", []),
+            })
+        polite_sleep()
+        return results
+    except Exception as e:
+        log.warning(f"scrape_greenhouse failed for {company.get('name', 'unknown')}: {e}")
+        return []
 
 
 def scrape_lever(company: dict) -> list[dict]:
-    lever_id = company.get("lever_id") or company["name"].lower().replace(" ", "").replace("/", "")
-    # Parse lever_id from career_url if available
-    career_url = company.get("career_url", "")
-    if "lever.co/" in career_url:
-        parts = career_url.split("lever.co/")
-        if len(parts) > 1:
-            lever_id = parts[1].split("?")[0].strip("/")
+    try:
+        lever_id = company.get("lever_id") or company["name"].lower().replace(" ", "").replace("/", "")
+        # Parse lever_id from career_url if available
+        career_url = company.get("career_url", "")
+        if "lever.co/" in career_url:
+            parts = career_url.split("lever.co/")
+            if len(parts) > 1:
+                lever_id = parts[1].split("?")[0].strip("/")
 
-    url = LEVER_API.format(lever_id)
-    data = fetch_json(url)
-    if not data or not isinstance(data, list):
+        url = LEVER_API.format(lever_id)
+        data = fetch_json(url)
+        if not data or not isinstance(data, list):
+            return []
+
+        results = []
+        for job in data:
+            title = job.get("text", "")
+            categories = job.get("categories", {})
+            commitment = categories.get("commitment", "")
+            if "intern" not in commitment.lower() and not is_relevant_title(title):
+                continue
+            if not is_relevant_title(title):
+                continue
+            description = strip_html(job.get("descriptionPlain", "") or job.get("description", ""))
+            if not is_relevant_season(title, description):
+                continue
+            job_url = job.get("hostedUrl", "")
+            location = categories.get("location", "US")
+            results.append({
+                "company": company["name"],
+                "title": title,
+                "url": job_url,
+                "location": location,
+                "platform": "Lever",
+                "tags": company.get("tags", []),
+            })
+        polite_sleep()
+        return results
+    except Exception as e:
+        log.warning(f"scrape_lever failed for {company.get('name', 'unknown')}: {e}")
         return []
 
-    results = []
-    for job in data:
-        title = job.get("text", "")
-        categories = job.get("categories", {})
-        commitment = categories.get("commitment", "")
-        if "intern" not in commitment.lower() and not is_relevant_title(title):
-            continue
-        if not is_relevant_title(title):
-            continue
-        job_url = job.get("hostedUrl", "")
-        location = categories.get("location", "US")
-        results.append({
-            "company": company["name"],
-            "title": title,
-            "url": job_url,
-            "location": location,
-            "platform": "Lever",
-            "tags": company.get("tags", []),
-        })
-    return results
+
+def scrape_ashby(company: dict) -> list[dict]:
+    try:
+        ashby_id = parse_ashby_id(company)
+        if not ashby_id:
+            return []
+
+        data = fetch_json(ASHBY_API.format(ashby_id))
+        if not data or not isinstance(data, dict):
+            return []
+
+        results = []
+        for job in data.get("jobs", []):
+            title = job.get("title", "")
+            if not is_relevant_title(title):
+                continue
+            description = strip_html(job.get("descriptionHtml", "") or job.get("description", ""))
+            if not is_relevant_season(title, description):
+                continue
+
+            location = get_first(job, ["locationName", "location"], "US")
+            if isinstance(job.get("location"), dict):
+                location = get_first(job["location"], ["name", "displayName"], location)
+            results.append({
+                "company": company["name"],
+                "title": title,
+                "url": job.get("jobUrl", "") or job.get("hostedUrl", ""),
+                "location": location or "US",
+                "platform": "Ashby",
+                "tags": company.get("tags", []),
+            })
+        polite_sleep()
+        return results
+    except Exception as e:
+        log.warning(f"scrape_ashby failed for {company.get('name', 'unknown')}: {e}")
+        return []
+
+
+def scrape_workday(company: dict) -> list[dict]:
+    try:
+        parts = parse_workday_parts(company)
+        if not parts:
+            return []
+
+        base_url, tenant, site = parts
+        api_url = f"{base_url}/wday/cxs/{tenant}/{site}/jobs"
+        payload = {
+            "appliedFacets": {},
+            "limit": 100,
+            "offset": 0,
+            "searchText": "intern",
+        }
+        data = fetch_json(api_url, data=payload)
+        if not data or not isinstance(data, dict):
+            return []
+
+        postings = data.get("jobPostings", []) or data.get("jobs", [])
+        results = []
+        for job in postings:
+            title = job.get("title", "") or job.get("jobPostingInfo", {}).get("title", "")
+            if not is_relevant_title(title):
+                continue
+            bullet_fields = " ".join(job.get("bulletFields", []) or [])
+            description = strip_html(job.get("description", "") or bullet_fields)
+            if not is_relevant_season(title, description):
+                continue
+
+            external_path = job.get("externalPath", "")
+            job_url = make_absolute_url(base_url, external_path)
+            location = job.get("locationsText", "") or ", ".join(job.get("locations", []) or []) or "US"
+            results.append({
+                "company": company["name"],
+                "title": title,
+                "url": job_url or company.get("career_url", ""),
+                "location": location,
+                "platform": "Workday",
+                "tags": company.get("tags", []),
+            })
+        polite_sleep()
+        return results
+    except Exception as e:
+        log.warning(f"scrape_workday failed for {company.get('name', 'unknown')}: {e}")
+        return []
+
+
+def scrape_smartrecruiters(company: dict) -> list[dict]:
+    try:
+        smartrecruiters_id = parse_smartrecruiters_id(company)
+        if not smartrecruiters_id:
+            return []
+
+        query = urlencode({"limit": 100, "q": "intern"})
+        data = fetch_json(SMARTRECRUITERS_API.format(smartrecruiters_id, query))
+        if not data or not isinstance(data, dict):
+            return []
+
+        results = []
+        for job in data.get("content", []) or data.get("postings", []):
+            title = job.get("name", "") or job.get("title", "")
+            if not is_relevant_title(title):
+                continue
+            if not is_relevant_season(title):
+                continue
+
+            location_data = job.get("location", {}) if isinstance(job.get("location"), dict) else {}
+            location = ", ".join(
+                part for part in [
+                    location_data.get("city"),
+                    location_data.get("region"),
+                    location_data.get("country"),
+                ] if part
+            ) or "US"
+            job_id_value = job.get("id", "") or job.get("uuid", "")
+            job_url = job.get("postingUrl", "") or job.get("applyUrl", "")
+            if not job_url and job_id_value:
+                slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+                job_url = f"https://jobs.smartrecruiters.com/{smartrecruiters_id}/{job_id_value}-{slug}"
+
+            results.append({
+                "company": company["name"],
+                "title": title,
+                "url": job_url or company.get("career_url", ""),
+                "location": location,
+                "platform": "SmartRecruiters",
+                "tags": company.get("tags", []),
+            })
+        polite_sleep()
+        return results
+    except Exception as e:
+        log.warning(f"scrape_smartrecruiters failed for {company.get('name', 'unknown')}: {e}")
+        return []
+
+
+def scrape_icims(company: dict) -> list[dict]:
+    try:
+        career_url = company.get("career_url", "")
+        if not career_url:
+            return []
+
+        parsed = urlparse(career_url)
+        search_url = career_url
+        if "?" in search_url:
+            search_url += "&searchKeyword=intern"
+        else:
+            search_url = make_absolute_url(career_url, "/jobs/search?searchKeyword=intern")
+
+        json_url = search_url + ("&" if "?" in search_url else "?") + "format=json"
+        data = fetch_json(json_url)
+        results = []
+        if isinstance(data, dict):
+            jobs = data.get("jobs", []) or data.get("searchResults", []) or data.get("results", [])
+            for job in jobs:
+                title = get_first(job, ["title", "jobtitle", "name"])
+                if not is_relevant_title(title) or not is_relevant_season(title):
+                    continue
+                href = get_first(job, ["url", "jobUrl", "applyUrl", "link"])
+                location = get_first(job, ["location", "jobLocation"], "US")
+                results.append({
+                    "company": company["name"],
+                    "title": title,
+                    "url": make_absolute_url(career_url, href) or career_url,
+                    "location": location or "US",
+                    "platform": "iCIMS",
+                    "tags": company.get("tags", []),
+                })
+        if results:
+            polite_sleep()
+            return results
+
+        html = fetch_html(search_url if parsed.netloc else career_url)
+        results = extract_icims_jobs_from_html(html, career_url, company)
+        polite_sleep()
+        return results
+    except Exception as e:
+        log.warning(f"scrape_icims failed for {company.get('name', 'unknown')}: {e}")
+        return []
 
 
 def parse_github_intern_table(raw_md: str, source_label: str) -> list[dict]:
@@ -254,76 +550,86 @@ def parse_github_intern_table(raw_md: str, source_label: str) -> list[dict]:
 
 def scrape_github_trackers() -> list[dict]:
     """Scrape community-maintained GitHub repos that track 2027 internships daily."""
-    trackers = [
-        {
-            "label": "speedyapply/2027-SWE",
-            "url": "https://raw.githubusercontent.com/speedyapply/2027-SWE-College-Jobs/main/README.md",
-        },
-        {
-            "label": "speedyapply/2027-AI",
-            "url": "https://raw.githubusercontent.com/speedyapply/2027-AI-College-Jobs/main/README.md",
-        },
-        {
-            "label": "vanshb03/Summer2027",
-            "url": "https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/README.md",
-        },
-        {
-            "label": "zapplyjobs/2027",
-            "url": "https://raw.githubusercontent.com/zapplyjobs/Internships-2027/main/README.md",
-        },
-    ]
+    try:
+        trackers = [
+            {
+                "label": "speedyapply/2027-SWE",
+                "url": "https://raw.githubusercontent.com/speedyapply/2027-SWE-College-Jobs/main/README.md",
+            },
+            {
+                "label": "speedyapply/2027-AI",
+                "url": "https://raw.githubusercontent.com/speedyapply/2027-AI-College-Jobs/main/README.md",
+            },
+            {
+                "label": "vanshb03/Summer2027",
+                "url": "https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/README.md",
+            },
+            {
+                "label": "zapplyjobs/2027",
+                "url": "https://raw.githubusercontent.com/zapplyjobs/Internships-2027/main/README.md",
+            },
+        ]
 
-    all_results = []
-    for tracker in trackers:
-        log.info(f"Checking GitHub tracker: {tracker['label']}...")
-        raw = fetch_html(tracker["url"])
-        if not raw:
-            continue
-        found = parse_github_intern_table(raw, tracker["label"])
-        log.info(f"  → {len(found)} relevant postings")
-        all_results.extend(found)
-        time.sleep(0.5)
+        all_results = []
+        for tracker in trackers:
+            log.info(f"Checking GitHub tracker: {tracker['label']}...")
+            raw = fetch_html(tracker["url"])
+            if not raw:
+                continue
+            found = parse_github_intern_table(raw, tracker["label"])
+            log.info(f"  → {len(found)} relevant postings")
+            all_results.extend(found)
+            polite_sleep()
 
-    return all_results
+        return all_results
+    except Exception as e:
+        log.warning(f"scrape_github_trackers failed: {e}")
+        return []
 
 
 def scrape_company_generic(company: dict) -> list[dict]:
     """Generic scraper: fetch career page and look for intern job links."""
-    url = company.get("career_url", "")
-    if not url:
-        return []
-    html = fetch_html(url)
-    if not html:
-        return []
+    try:
+        url = company.get("career_url", "")
+        if not url:
+            return []
+        html = fetch_html(url)
+        if not html:
+            return []
 
-    results = []
-    # Look for job title patterns near intern keywords
-    # Find all anchor tags
-    anchors = re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([^<]{5,120})</a>', html, re.IGNORECASE)
-    for href, text in anchors:
-        text_clean = re.sub(r'\s+', ' ', text).strip()
-        if not is_relevant_title(text_clean):
-            continue
-        if not is_relevant_season(text_clean):
-            continue
-        # Make absolute URL
-        if href.startswith("http"):
-            full_url = href
-        elif href.startswith("/"):
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            full_url = f"{parsed.scheme}://{parsed.netloc}{href}"
-        else:
-            continue
-        results.append({
-            "company": company["name"],
-            "title": text_clean,
-            "url": full_url,
-            "location": "US",
-            "platform": "Career Page",
-            "tags": company.get("tags", []),
-        })
-    return results
+        results = []
+        # Look for visible job links, including anchors that contain nested tags.
+        anchors = re.findall(
+            r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            html,
+            re.IGNORECASE | re.DOTALL
+        )
+        for href, text in anchors:
+            text_clean = strip_html(text)
+            if not text_clean or len(text_clean) > 160:
+                continue
+            if not is_relevant_title(text_clean):
+                continue
+            nearby = text_clean
+            if not is_relevant_season(text_clean, nearby):
+                continue
+
+            full_url = make_absolute_url(url, href)
+            if not full_url or full_url.startswith("mailto:"):
+                continue
+            results.append({
+                "company": company["name"],
+                "title": text_clean,
+                "url": full_url,
+                "location": "US",
+                "platform": "Career Page",
+                "tags": company.get("tags", []),
+            })
+        polite_sleep()
+        return results
+    except Exception as e:
+        log.warning(f"scrape_company_generic failed for {company.get('name', 'unknown')}: {e}")
+        return []
 
 
 # ── Main scrape loop ──────────────────────────────────────────────────────────
@@ -353,10 +659,20 @@ def scrape_all() -> list[dict]:
         log.info(f"Checking {name} ({platform})...")
 
         try:
-            if platform == "greenhouse" and company.get("greenhouse_id"):
+            if platform == "greenhouse":
                 jobs = scrape_greenhouse(company)
             elif platform == "lever":
                 jobs = scrape_lever(company)
+            elif platform == "ashby":
+                jobs = scrape_ashby(company)
+            elif platform == "workday":
+                jobs = scrape_workday(company)
+            elif platform == "smartrecruiters":
+                jobs = scrape_smartrecruiters(company)
+            elif platform == "icims":
+                jobs = scrape_icims(company)
+            elif platform in ("generic", "custom"):
+                jobs = scrape_company_generic(company)
             else:
                 jobs = scrape_company_generic(company)
 
@@ -365,7 +681,7 @@ def scrape_all() -> list[dict]:
         except Exception as e:
             log.error(f"  → Error scraping {name}: {e}")
 
-        # Polite delay between requests
+        # Polite delay between companies
         time.sleep(random.uniform(0.5, 1.5))
 
     return all_jobs
